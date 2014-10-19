@@ -25,6 +25,25 @@ from threading             import Thread
 
 import smbus
 
+import atexit, time
+
+
+from mpd import MPDClient
+
+client = MPDClient()
+
+# Volume rotary encoder
+LEFT_SWITCH = 14
+RIGHT_SWITCH = 15
+MUTE_SWITCH = 4
+# Tuner rotary encoder
+UP_SWITCH = 17
+DOWN_SWITCH = 18
+MENU_SWITCH = 25
+
+
+
+
 # initialize the LCD plate
 #   use busnum = 0 for raspi version 1 (256MB) 
 #   and busnum = 1 for raspi version 2 (512MB)
@@ -48,8 +67,107 @@ LEFT           = 0x10
 UP_AND_DOWN    = 0x0C
 LEFT_AND_RIGHT = 0x12
 
-HOME = '/home/pi/pi-plate-radio'
+HOME = '/home/pi/PiCcola'
 
+VOL_MIN      = -20
+VOL_MAX      =  15
+VOL_DEFAULT  =   0
+
+volCur       = VOL_MIN   
+volNew       = VOL_DEFAULT # 'Next' volume after interactions
+volSpeed     = 1.0         # Speed of volume change (accelerates w/hold)
+volSet       = False       # True if currently setting volume
+
+# Char 7 gets reloaded for different modes.  These are the bitmaps:
+charSevenBitmaps = [
+  [0b10000, # Play (also selected station)
+   0b11000,
+   0b11100,
+   0b11110,
+   0b11100,
+   0b11000,
+   0b10000,
+   0b00000],
+  [0b11011, # Pause
+   0b11011,
+   0b11011,
+   0b11011,
+   0b11011,
+   0b11011,
+   0b11011,
+   0b00000],
+  [0b00000, # Next Track
+   0b10100,
+   0b11010,
+   0b11101,
+   0b11010,
+   0b10100,
+   0b00000,
+   0b00000]]
+
+
+#
+# rotary encoders stuff
+#
+
+from rotary_class import RotaryEncoder
+import re
+
+global volumeknob, tunerknob
+
+def getBoardRevision():
+	revision = 1
+	with open("/proc/cpuinfo") as f:
+		cpuinfo = f.read()
+	rev_hex = re.search(r"(?<=\nRevision)[ |:|\t]*(\w+)", cpuinfo).group(1)
+	rev_int = int(rev_hex,16)
+	if rev_int > 3:
+		revision = 2
+	boardrevision = revision
+	return boardrevision
+
+
+def tuner_event(event):
+  print "tuner"
+  global tunerknob
+  switch = 0
+  ButtonNotPressed = tunerknob.getSwitchState(MENU_SWITCH)
+  # Suppress events if tuner button pressed
+  if ButtonNotPressed:
+    if event == RotaryEncoder.CLOCKWISE:
+      switch = UP_SWITCH
+      print "rotate clockwise"
+    elif event == RotaryEncoder.ANTICLOCKWISE:
+      switch = DOWN_SWITCH
+      print "rotate anticlockwise"
+  if event ==  RotaryEncoder.BUTTONDOWN:
+    switch = MENU_SWITCH
+    print "push button"
+  return
+  
+def volume_event(event):
+  print "volume"
+  global volumeknob
+  switch = 0
+  ButtonNotPressed = volumeknob.getSwitchState(MUTE_SWITCH)
+  # Suppress events if volume button pressed
+  if ButtonNotPressed:
+    if event == RotaryEncoder.CLOCKWISE:
+      switch = RIGHT_SWITCH
+      print "rotate clockwise"
+      output = run_cmd("mpc volume +2")
+    elif event == RotaryEncoder.ANTICLOCKWISE:
+      switch = LEFT_SWITCH
+      print "rotate anticlockwise"
+      output = run_cmd("mpc volume +2")
+  if event ==  RotaryEncoder.BUTTONDOWN:
+    switch = MUTE_SWITCH
+    print "push button"
+  return  
+
+
+volumeknob = RotaryEncoder(LEFT_SWITCH,RIGHT_SWITCH,MUTE_SWITCH,volume_event,getBoardRevision())
+tunerknob = RotaryEncoder(UP_SWITCH,DOWN_SWITCH,MENU_SWITCH,tuner_event,getBoardRevision())
 
 # ----------------------------
 # WORKER THREAD
@@ -70,6 +188,15 @@ def update_lcd(q):
    return
 
 
+def cleanExit():
+    if LCD is not None:
+        time.sleep(0.5)
+        LCD.backlight(LCD.OFF)
+        LCD.clear()
+        LCD.stop()
+        run_cmd("mpc stop")
+
+
 
 # ----------------------------
 # MAIN LOOP
@@ -77,6 +204,8 @@ def update_lcd(q):
 
 def main():
    global STATION, NUM_STATIONS, PLAYLIST_MSG
+
+   atexit.register(cleanExit)
 
    # Stop music player
    output = run_cmd("mpc stop" )
@@ -92,13 +221,31 @@ def main():
    worker.start()
    
    # Display startup banner
-   LCD_QUEUE.put('Welcome to\nUsualPanic Radio', True)
+   LCD_QUEUE.put('    PiCcola\n  Radio', True)
 
    # Load our station playlist
    load_playlist()
    sleep(2)
    LCD.clear()
 
+
+    # Create volume bargraph custom characters (chars 0-5):
+   for i in range(6):
+      bitmap = []
+      bits   = (255 << (5 - i)) & 0x1f
+      for j in range(8): bitmap.append(bits)
+      LCD.createChar(i, bitmap)
+
+   # Create up/down icon (char 6)
+   LCD.createChar(6,
+      [0b00100,
+      0b01110,
+      0b11111,
+      0b00000,
+      0b00000,
+      0b11111,
+      0b01110,
+      0b00100])
 
 
 # ----------------------------
@@ -107,7 +254,7 @@ def main():
 
    # Start music player
    LCD_QUEUE.put(PLAYLIST_MSG[STATION - 1], True)
-   run_cmd("mpc volume +100")
+   run_cmd("mpc volume +2")
    mpc_play(STATION)
    countdown_to_play = 0
       
@@ -133,14 +280,44 @@ def main():
          # start play in 300msec unless another key pressed
          countdown_to_play = 3
 
-      # UP button pressed
-      if(press == UP):
-         output = run_cmd("mpc volume +2")
+      # # UP button pressed
+      # if(press == UP):
+      #    output = run_cmd("mpc volume +2")
+      #    print "vol up ="+output
+      #
+      # # DOWN button pressed
+      # if(press == DOWN):
+      #    output = run_cmd("mpc volume -2")
+      #    print "vol down ="+output
 
-      # DOWN button pressed
-      if(press == DOWN):
-         output = run_cmd("mpc volume -2")
-
+      if press == UP or press == DOWN:
+          # Just entering volume-setting mode; init display
+         LCD.setCursor(0, 1)
+         volCurI = int((volCur - VOL_MIN) + 0.5)
+         n = int(volCurI / 5)
+         s = (chr(6) + ' Volume ' +
+            chr(5) * n +       # Solid brick(s)
+            chr(volCurI % 5) + # Fractional brick 
+            chr(0) * (6 - n))  # Spaces
+         LCD.message(s)
+         volSet   = True
+         volSpeed = 1.0
+         # Volume-setting mode now active (or was already there);
+         # act on button press.
+         if press == UP:
+            print "press UP"
+            volNew = volCur + volSpeed
+            if volNew > VOL_MAX: volNew = VOL_MAX
+         else:
+            print "press Down"
+            volNew = volCur - volSpeed
+            if volNew < VOL_MIN: volNew = VOL_MIN
+         volTime   = time.time() # Time of last volume button press
+         volSpeed *= 1.15        # Accelerate volume change
+         print "volume = %s"% volCur
+         
+         
+      
       # SELECT button pressed
       if(press == SELECT):
          menu_pressed()
